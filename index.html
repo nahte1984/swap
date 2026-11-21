@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#313131">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>SCAN→NER</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,200..800&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #313131;
+    --c: #1eff00;               /* 由 JS 每幀改寫，色相繞色相環 */
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  body {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  #stage {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    background: var(--bg);
+  }
+
+  /* 影片元素要留在 DOM 裡（iOS 才會持續更新畫面），但看不到 */
+  #cam {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* ---------- splash ---------- */
+  #splash {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg);
+    z-index: 2;
+  }
+  #splash.gone { display: none; }
+
+  #go {
+    -webkit-appearance: none;
+    appearance: none;
+    margin: 0;
+    height: 38px;
+    padding: 0 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid var(--c);
+    border-radius: 0;
+    color: var(--c);
+    font-family: 'Bricolage Grotesque', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-weight: 300;
+    font-size: 28px;
+    line-height: normal;
+    font-variation-settings: "opsz" 14, "wdth" 100;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  #go:disabled { cursor: default; }
+  #go:focus { outline: none; }
+
+  #msg {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: calc(50% + 36px);
+    text-align: center;
+    color: var(--c);
+    font-family: 'Bricolage Grotesque', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    font-weight: 300;
+    font-size: 14px;
+    font-variation-settings: "opsz" 14, "wdth" 100;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="stage"></canvas>
+<video id="cam" playsinline muted autoplay></video>
+
+<div id="splash">
+  <button id="go" type="button">SCAN→NER</button>
+  <div id="msg"></div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ================= 參數 ================= */
+  const DURATION   = 8000;   // 從圓心掃到最外圈（填滿畫面）的時間，ms
+  const HUE_START  = 113;    // #1eff00 的色相
+  const HUE_PERIOD = 15000;  // splash 色相環走完一圈的時間，ms
+  const MAX_DPR    = 2;      // 畫布解析度上限
+  const BG         = [49 / 255, 49 / 255, 49 / 255]; // #313131
+
+  const splash = document.getElementById('splash');
+  const go     = document.getElementById('go');
+  const msg    = document.getElementById('msg');
+  const canvas = document.getElementById('stage');
+  const video  = document.getElementById('cam');
+  const root   = document.documentElement;
+
+  /* ================= splash：框線與文字的色相漸變 ================= */
+  let hueRAF = 0;
+  const hueT0 = performance.now();
+  function hueTick(now) {
+    const h = (HUE_START + ((now - hueT0) / HUE_PERIOD) * 360) % 360;
+    root.style.setProperty('--c', `hsl(${h.toFixed(2)}, 100%, 50%)`); // 最高彩度
+    hueRAF = requestAnimationFrame(hueTick);
+  }
+  hueRAF = requestAnimationFrame(hueTick);
+
+  /* ================= WebGL ================= */
+  const VERT = `
+    attribute vec2 aPos;
+    void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+  `;
+
+  // 對每個像素反向取樣：
+  //   半徑 r  → 攝影機畫面的第幾條 x 軸（r=0 是第一條，r=Rmax 是最後一條）
+  //   角度 θ  → 那條 x 軸上的位置（12 點鐘方向起、順時針繞一圈 = 由左到右）
+  // 每一幀只畫 [uR0, uR1) 這一圈，其餘像素 discard，畫布保留上一幀內容 → slit-scan
+  const FRAG = `
+    #ifdef GL_FRAGMENT_PRECISION_HIGH
+      precision highp float;
+    #else
+      precision mediump float;
+    #endif
+    uniform sampler2D uTex;
+    uniform vec2  uCenter;  // 畫面中心（裝置像素）
+    uniform float uRmax;    // 畫面對角線的一半 = 最外圈
+    uniform float uR0;
+    uniform float uR1;
+    uniform vec4  uCrop;    // 攝影機畫面 cover 到螢幕比例後的範圍：x0, y0, w, h
+    void main() {
+      vec2 p = gl_FragCoord.xy - uCenter;          // y 朝上
+      float r = length(p);
+      if (r < uR0 || r >= uR1) discard;
+      float a = atan(p.x, p.y);                    // 12 點鐘 = 0，順時針遞增
+      float u = fract(a / 6.283185307179586 + 1.0);
+      float v = clamp(r / uRmax, 0.0, 1.0);
+      vec2 tc = uCrop.xy + vec2(u, v) * uCrop.zw;
+      gl_FragColor = vec4(texture2D(uTex, tc).rgb, 1.0);
+    }
+  `;
+
+  let gl = null, prog = null, tex = null, U = {};
+
+  function initGL() {
+    if (gl) return true;
+    gl = canvas.getContext('webgl', {
+      preserveDrawingBuffer: true,
+      antialias: false,
+      alpha: false,
+      depth: false,
+      stencil: false,
+      premultipliedAlpha: false
+    }) || canvas.getContext('experimental-webgl', { preserveDrawingBuffer: true, alpha: false });
+    if (!gl) return false;
+
+    const sh = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl.VERTEX_SHADER, VERT));
+    gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FRAG));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, 'aPos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    ['uTex', 'uCenter', 'uRmax', 'uR0', 'uR1', 'uCrop'].forEach(n => { U[n] = gl.getUniformLocation(prog, n); });
+
+    tex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.uniform1i(U.uTex, 0);
+    return true;
+  }
+
+  /* ================= 尺寸 ================= */
+  let W = 0, H = 0, Rmax = 0;
+
+  function clearStage() {
+    gl.clearColor(BG[0], BG[1], BG[2], 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+
+  function resize() {
+    if (!gl) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+    const w = Math.max(1, Math.round(window.innerWidth * dpr));
+    const h = Math.max(1, Math.round(window.innerHeight * dpr));
+    if (w === W && h === H) return;
+    W = canvas.width = w;
+    H = canvas.height = h;
+    Rmax = Math.hypot(W, H) / 2;
+    gl.viewport(0, 0, W, H);
+    gl.uniform2f(U.uCenter, W / 2, H / 2);
+    gl.uniform1f(U.uRmax, Rmax);
+    clearStage();
+    t0 = null;                                   // 尺寸變了就從圓心重新開始
+  }
+
+  let resizeTimer = 0;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 120);
+  });
+
+  // 攝影機畫面以 cover 方式對到螢幕比例（等同全螢幕顯示時看到的那個畫面）
+  function updateCrop() {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const va = vw / vh, sa = W / H;
+    if (va > sa) {
+      const cw = sa / va;
+      gl.uniform4f(U.uCrop, (1 - cw) / 2, 0, cw, 1);
+    } else {
+      const ch = va / sa;
+      gl.uniform4f(U.uCrop, 0, (1 - ch) / 2, 1, ch);
+    }
+  }
+
+  /* ================= 掃描 ================= */
+  let running = false;
+  let t0 = null;      // 本輪開始時間
+  let lastT = 0;      // 上一幀的累積進度（單位：圈）
+
+  function drawBand(p0, p1) {
+    const r0 = p0 * Rmax;
+    const r1 = p1 >= 1 ? Rmax + 2 : p1 * Rmax;   // 最後一圈多留 2px，確保四個角落填滿
+    if (r1 <= r0) return;
+    gl.uniform1f(U.uR0, r0);
+    gl.uniform1f(U.uR1, r1);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (!running || video.readyState < 2 || !video.videoWidth) return;
+
+    if (t0 === null) { t0 = now; lastT = 0; return; }
+
+    const a = lastT;
+    const b = (now - t0) / DURATION;
+    if (b <= a) return;
+    lastT = b;
+
+    // 這一幀的攝影機畫面
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, video);
+    updateCrop();
+
+    if (b - a >= 1) {                            // 例如分頁切回來，一次掉了超過一輪
+      drawBand(0, 1);
+      return;
+    }
+    const fa = a - Math.floor(a);
+    const fb = b - Math.floor(b);
+    if (Math.floor(b) > Math.floor(a)) {         // 這一幀跨過最外圈 → 回到圓心繼續下一輪
+      drawBand(fa, 1);
+      drawBand(0, fb);
+    } else {
+      drawBand(fa, fb);
+    }
+  }
+
+  /* ================= 開始 ================= */
+  async function start() {
+    go.disabled = true;
+    msg.textContent = '';
+    try {
+      if (!initGL()) throw new Error('webgl');
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error('nocam');
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: 'user',
+          width:  { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      resize();
+      t0 = null;
+      running = true;
+      splash.classList.add('gone');
+      cancelAnimationFrame(hueRAF);
+    } catch (err) {
+      console.error(err);
+      go.disabled = false;
+      msg.textContent = (err && err.message === 'webgl')
+        ? 'WebGL unavailable'
+        : 'camera unavailable — tap to retry';
+    }
+  }
+
+  go.addEventListener('click', start);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
