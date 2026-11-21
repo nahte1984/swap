@@ -196,11 +196,15 @@
   `;
 
   // 對每個像素反向取樣：
-  //   半徑 r  → 攝影機畫面的第幾條 x 軸
-  //   角度 θ  → 那條 x 軸上的位置
-  // 兩種掃描方向（點螢幕切換）：
-  //   uFlip = 0：最上面一條 → 圓心，最底一條 → 最外圈；12 點鐘起順時針 = 由左到右（臉落在下方、正立）
-  //   uFlip = 1：最底一條 → 圓心，最上面一條 → 最外圈；6 點鐘起逆時針 = 由左到右（臉落在上方、正立）← 預設
+  //   「半徑」r → 攝影機畫面的第幾條 x 軸
+  //   沿著那一圈的位置 → 那條 x 軸上的位置（一條 x 軸等比拉長／縮短成那一圈的周長）
+  // 取樣形狀 uShape：
+  //   0 = 圓形：r = 到中心的距離，最外圈 = 畫面對角線的一半
+  //   1 = 方形：同心長方形，長寬比 = 螢幕比例，最外圈 = 螢幕邊框
+  //       r = max(|x| / aspect, |y|)，那一圈的半寬 = r·aspect、半高 = r
+  // 掃描方向 uFlip：
+  //   0：最上面一條 → 中心，最底一條 → 最外圈；12 點鐘起順時針 = 由左到右（臉落在下方、正立）
+  //   1：最底一條 → 中心，最上面一條 → 最外圈；6 點鐘起逆時針 = 由左到右（臉落在上方、正立）
   // 每一幀只畫 [uR0, uR1) 這一圈，其餘像素 discard，畫布保留上一幀內容 → slit-scan
   const FRAG = `
     #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -210,17 +214,38 @@
     #endif
     uniform sampler2D uTex;
     uniform vec2  uCenter;  // 畫面中心（裝置像素）
-    uniform float uRmax;    // 畫面對角線的一半 = 最外圈
+    uniform float uRmax;    // 最外圈
     uniform float uR0;
     uniform float uR1;
     uniform vec4  uCrop;    // 攝影機畫面 cover 到螢幕比例後的範圍：x0, y0, w, h
     uniform float uFlip;    // 0 或 1，掃描方向
+    uniform float uShape;   // 0 圓形，1 方形（貼合螢幕比例）
+    uniform float uAspect;  // 螢幕寬 / 高
     void main() {
       vec2 p = gl_FragCoord.xy - uCenter;          // y 朝上
-      float r = length(p);
+      float r, u;
+      if (uShape < 0.5) {
+        r = length(p);
+        float a = atan(p.x, p.y);                  // 12 點鐘 = 0，順時針遞增
+        u = fract(a / 6.283185307179586 + 1.0);
+      } else {
+        float ax = abs(p.x) / uAspect, ay = abs(p.y);
+        r = max(ax, ay);                           // 同心長方形（螢幕比例）
+        float hw = r * uAspect;                    // 這一圈的半寬
+        float hh = r;                              // 這一圈的半高
+        float per = 4.0 * (hw + hh);               // 周長
+        // 沿長方形周長的位置：12 點鐘（上邊中點）起順時針
+        float arc;
+        if (ay >= ax) {
+          arc = p.y > 0.0 ? (p.x >= 0.0 ? p.x : per + p.x)              // 上邊
+                          : 2.0 * hw + 2.0 * hh - p.x;                  // 下邊
+        } else {
+          arc = p.x > 0.0 ? hw + hh - p.y                               // 右邊
+                          : 3.0 * hw + 3.0 * hh + p.y;                  // 左邊
+        }
+        u = r > 0.0 ? fract(arc / per) : 0.0;
+      }
       if (r < uR0 || r >= uR1) discard;
-      float a = atan(p.x, p.y);                    // 12 點鐘 = 0，順時針遞增
-      float u = fract(a / 6.283185307179586 + 1.0);
       float v = clamp(r / uRmax, 0.0, 1.0);
       if (uFlip > 0.5) {
         u = fract(1.5 - u);                        // 改成 6 點鐘起、逆時針
@@ -232,7 +257,14 @@
   `;
 
   let gl = null, prog = null, tex = null, U = {};
-  let flip = true;    // 目前的掃描方向（預設：相機畫面最底 → 圓心，最上方 → 最外圈）
+  // 四個模式，點螢幕依序切換
+  const MODES = [
+    { flip: 1, shape: 0 },  // 載入時：最底 → 圓心，最上方 → 最外圈（圓形）
+    { flip: 0, shape: 0 },  // 最上方 → 圓心，最底 → 最外圈（圓形）
+    { flip: 1, shape: 1 },  // 最底 → 中心，最上方 → 最外圈（方形，貼合螢幕比例）
+    { flip: 0, shape: 1 }   // 最上方 → 中心，最底 → 最外圈（方形，貼合螢幕比例）
+  ];
+  let mode = 0;
 
   function initGL() {
     if (gl) return true;
@@ -267,8 +299,7 @@
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-    ['uTex', 'uCenter', 'uRmax', 'uR0', 'uR1', 'uCrop', 'uFlip'].forEach(n => { U[n] = gl.getUniformLocation(prog, n); });
-    gl.uniform1f(U.uFlip, flip ? 1 : 0);
+    ['uTex', 'uCenter', 'uRmax', 'uR0', 'uR1', 'uCrop', 'uFlip', 'uShape', 'uAspect'].forEach(n => { U[n] = gl.getUniformLocation(prog, n); });
 
     tex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0);
@@ -298,12 +329,23 @@
     if (w === W && h === H) return;
     W = canvas.width = w;
     H = canvas.height = h;
-    Rmax = Math.hypot(W, H) / 2;
     gl.viewport(0, 0, W, H);
     gl.uniform2f(U.uCenter, W / 2, H / 2);
-    gl.uniform1f(U.uRmax, Rmax);
+    applyMode();
     clearStage();
     t0 = null;                                   // 尺寸變了就從圓心重新開始
+  }
+
+  // 套用目前模式：方向、形狀、最外圈大小
+  function applyMode() {
+    const m = MODES[mode];
+    Rmax = m.shape === 0
+      ? Math.hypot(W, H) / 2                     // 圓：剛好蓋住四個角
+      : H / 2;                                   // 方形：最外圈就是螢幕邊框（以半高計）
+    gl.uniform1f(U.uFlip, m.flip);
+    gl.uniform1f(U.uShape, m.shape);
+    gl.uniform1f(U.uAspect, W / H);
+    gl.uniform1f(U.uRmax, Rmax);
   }
 
   let resizeTimer = 0;
@@ -472,12 +514,12 @@
     if (f) startImage(f);
   });
 
-  /* ================= 點螢幕任一處：換掃描方向，從圓心重新掃 ================= */
+  /* ================= 點螢幕任一處：換到下一個模式，從中心重新掃 ================= */
   window.addEventListener('pointerdown', (e) => {
     if (!running || !gl) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
-    flip = !flip;
-    gl.uniform1f(U.uFlip, flip ? 1 : 0);
+    mode = (mode + 1) % MODES.length;
+    applyMode();
     t0 = null;
   });
 
