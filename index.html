@@ -145,8 +145,11 @@
   `;
 
   // 對每個像素反向取樣：
-  //   半徑 r  → 攝影機畫面的第幾條 x 軸（r=0 是第一條，r=Rmax 是最後一條）
-  //   角度 θ  → 那條 x 軸上的位置（12 點鐘方向起、順時針繞一圈 = 由左到右）
+  //   半徑 r  → 攝影機畫面的第幾條 x 軸
+  //   角度 θ  → 那條 x 軸上的位置
+  // 兩種掃描方向（點螢幕切換）：
+  //   uFlip = 0：最上面一條 → 圓心，最底一條 → 最外圈；12 點鐘起順時針 = 由左到右（臉落在下方、正立）
+  //   uFlip = 1：最底一條 → 圓心，最上面一條 → 最外圈；6 點鐘起逆時針 = 由左到右（臉落在上方、正立）
   // 每一幀只畫 [uR0, uR1) 這一圈，其餘像素 discard，畫布保留上一幀內容 → slit-scan
   const FRAG = `
     #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -160,6 +163,7 @@
     uniform float uR0;
     uniform float uR1;
     uniform vec4  uCrop;    // 攝影機畫面 cover 到螢幕比例後的範圍：x0, y0, w, h
+    uniform float uFlip;    // 0 或 1，掃描方向
     void main() {
       vec2 p = gl_FragCoord.xy - uCenter;          // y 朝上
       float r = length(p);
@@ -167,12 +171,17 @@
       float a = atan(p.x, p.y);                    // 12 點鐘 = 0，順時針遞增
       float u = fract(a / 6.283185307179586 + 1.0);
       float v = clamp(r / uRmax, 0.0, 1.0);
+      if (uFlip > 0.5) {
+        u = fract(1.5 - u);                        // 改成 6 點鐘起、逆時針
+        v = 1.0 - v;                               // 底 → 圓心，頂 → 最外圈
+      }
       vec2 tc = uCrop.xy + vec2(u, v) * uCrop.zw;
       gl_FragColor = vec4(texture2D(uTex, tc).rgb, 1.0);
     }
   `;
 
   let gl = null, prog = null, tex = null, U = {};
+  let flip = false;   // 目前的掃描方向
 
   function initGL() {
     if (gl) return true;
@@ -207,7 +216,8 @@
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-    ['uTex', 'uCenter', 'uRmax', 'uR0', 'uR1', 'uCrop'].forEach(n => { U[n] = gl.getUniformLocation(prog, n); });
+    ['uTex', 'uCenter', 'uRmax', 'uR0', 'uR1', 'uCrop', 'uFlip'].forEach(n => { U[n] = gl.getUniformLocation(prog, n); });
+    gl.uniform1f(U.uFlip, flip ? 1 : 0);
 
     tex = gl.createTexture();
     gl.activeTexture(gl.TEXTURE0);
@@ -340,6 +350,15 @@
         : 'camera unavailable — tap to retry';
     }
   }
+
+  /* ================= 點螢幕任一處：換掃描方向，從圓心重新掃 ================= */
+  window.addEventListener('pointerdown', (e) => {
+    if (!running || !gl) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    flip = !flip;
+    gl.uniform1f(U.uFlip, flip ? 1 : 0);
+    t0 = null;
+  });
 
   go.addEventListener('click', start);
   requestAnimationFrame(frame);
